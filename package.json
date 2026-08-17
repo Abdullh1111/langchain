@@ -2,12 +2,26 @@
   "name": "langchain",
   "version": "1.0.0",
   "main": "index.js",
+  "type": "module",
   "license": "MIT",
+  "scripts": {
+    "old": "node index.js",
+    "agent": "node agent/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
   "dependencies": {
+    "@langchain/classic": "^1.0.43",
     "@langchain/core": "^1.2.8",
+    "@langchain/langgraph": "^1.4.10",
+    "@langchain/mcp-adapters": "^1.1.3",
     "@langchain/openrouter": "^0.4.8",
+    "@langchain/textsplitters": "^1.0.1",
     "dotenv": "^17.4.2",
     "langchain": "^1.5.9",
     "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.10"
   }
 }
