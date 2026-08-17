@@ -1,3 +1,4 @@
+import { ChatOpenRouter } from "@langchain/openrouter";
 import { config } from "dotenv";
 import readline from "readline/promises";
 
@@ -10,6 +11,11 @@ const rl = readline.createInterface({
 
 console.log("api key:", process.env.OPENROUTER_API_KEY);
 
+const model = new ChatOpenRouter({
+  apiKey: process.env.OPENROUTER_API_KEY,
+  model: "deepseek/deepseek-v4-pro",
+});
+
 while (true) {
   const question = await rl.question("Ask a question (q to quit): ");
 
@@ -17,7 +23,14 @@ while (true) {
     break;
   }
 
-  console.log("question:", question);
+  const response = await model.invoke([
+    {
+      role: "user",
+      content: question,
+    },
+  ]);
+
+  console.log({ response: response.content });
 }
 
 rl.close();
