@@ -5,6 +5,7 @@
 // Step 5 — built-in middleware (budget + retry).
 // Step 6 — contextSchema + runtime.context (tool jane ke jiggesh korche).
 // Step 7 — content_and_artifact (model summary dekhe, code full data pay).
+// Step 8 — structured output (uttor string na, typed object).
 import { ChatOpenRouter } from "@langchain/openrouter";
 import { config } from "dotenv";
 import {
@@ -32,6 +33,12 @@ const model = new ChatOpenRouter({
 
 // 3. tool
 // [Step 6] 2nd argument `runtime` — ekhane-i context, writer, toolCallId.
+// [Step 8] Tool ta ekhon HONEST — ja jane na, ta bole dey. Age eta jekono
+// city-r jonno "24°C and sunny" ferot dito, tai model "Mars"-eo confident
+// uttor dito. Tool jodi mithye na bole, tobei schema-r `confidence` field-er
+// kono mane thake.
+const KNOWN = { Dhaka: 24, Sylhet: 26, Chattogram: 28, Sydney: 19 };
+
 const getWeather = tool(
   ({ city }, runtime) => {
     console.error("weather tool called");
@@ -39,8 +46,13 @@ const getWeather = tool(
     // Model ei value gula pathay NAI — code theke esheche.
     const { userName, timezone, role } = runtime.context;
 
+    const temp = KNOWN[city];
+    if (temp === undefined) {
+      return `No weather station for "${city}". Known: ${Object.keys(KNOWN).join(", ")}.`;
+    }
+
     return (
-      `It's 24°C and sunny in ${city}. ` +
+      `It's ${temp}°C and sunny in ${city}. ` +
       `(for ${userName}, tz ${timezone}, role ${role})`
     );
   },
@@ -134,6 +146,20 @@ const getWeekly = tool(
   },
 );
 
+// ─── [Step 8] structured output ─────────────────────────────────────────────
+//
+// `.describe()` gula shudhu comment na — model EI GULA PORE. Schema ta-i
+// tomar prompt. Bhalo describe = bhalo output.
+const WeatherReply = z.object({
+  answer: z.string().describe("One short sentence to show the user"),
+  city: z.string().describe("The city the answer is about"),
+  tempC: z.number().nullable().describe("Temperature in Celsius, null if unknown"),
+  confidence: z
+    .enum(["high", "medium", "low"])
+    .describe("low if you could not use a tool and had to guess"),
+  needsFollowUp: z.boolean().describe("true if the question was ambiguous"),
+});
+
 // ─── [Step 4] nijer middleware ──────────────────────────────────────────────
 //
 // Middleware = agent-er loop-er majhe tomar code dhukanor jayga.
@@ -208,8 +234,9 @@ const traceMiddleware = createMiddleware({
   },
 });
 
-// 4. agent — `new` na, plain function call
-const agent = createAgent({
+// 4. agent config. [Step 8] duita agent lagbe, tai config ta alada kore
+// rakhchi ar duijaygay spread korbo.
+const shared = {
   model,
   tools: [getWeather, getForecast, getWeekly],
 
@@ -251,6 +278,25 @@ Rules:
 - Always use the get_weather tool. Never answer weather from memory.
 - Reply in one short sentence.
 - If the user asks anything unrelated to weather, say you only do weather.`,
+};
+
+// Normal agent — streaming er jonno. responseFormat NEI.
+const agent = createAgent({ ...shared, name: "weather" });
+
+// [Step 8] Structured agent — `responseFormat` deoya.
+//
+// KENO alada instance: responseFormat set thakle model-er shesh output ta
+// ekta JSON tool call hoy, text na. Mane `message.text` FAKA thakbe ar
+// streaming er kono mane thake na. Tai ei ta `invoke()` diye chalabo.
+//
+// Bare zod schema pathacchi — LangChain nijei decide kore:
+//   model native JSON mode support kore → providerStrategy
+//   kore na                            → toolStrategy e fallback
+// Force korte chaile `toolStrategy(WeatherReply)` ba `providerStrategy(...)`.
+const structuredAgent = createAgent({
+  ...shared,
+  name: "weather-structured",
+  responseFormat: WeatherReply,
 });
 
 // ─── [Step 2] terminal loop + history ───────────────────────────────────────
@@ -333,6 +379,19 @@ while (true) {
   if (question.trim() === "q") break;
   if (!question.trim()) continue;
   console.log("\n\n\n", { history }, "\n\n\n");
+
+  // [Step 8] `/json <prosno>` — structured output. Streaming nei, invoke().
+  if (question.startsWith("/json ")) {
+    const r = await structuredAgent.invoke(
+      { messages: [...history, { role: "user", content: question.slice(6) }] },
+      runConfig,
+    );
+    history = r.messages;
+
+    // Parsed object ekhane. responseFormat na dile ei key ta thake-i na.
+    console.log(JSON.stringify(r.structuredResponse, null, 2), "\n");
+    continue;
+  }
 
   const result = await streamRun({
     messages: [...history, { role: "user", content: question }],
