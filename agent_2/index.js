@@ -4,6 +4,7 @@
 // Step 4 — nijer middleware (createMiddleware er 6 ta hook).
 // Step 5 — built-in middleware (budget + retry).
 // Step 6 — contextSchema + runtime.context (tool jane ke jiggesh korche).
+// Step 7 — content_and_artifact (model summary dekhe, code full data pay).
 import { ChatOpenRouter } from "@langchain/openrouter";
 import { config } from "dotenv";
 import {
@@ -89,6 +90,50 @@ const getForecast = tool(
   },
 );
 
+// ─── [Step 7] content_and_artifact ──────────────────────────────────────────
+//
+// Ei tool ta 7 din-er data ferot dey. Puro data model ke dile ~400 token,
+// ar model tar bhitor theke asol kaj hariye fele. Tai duita jinis:
+//
+//   return [ content, artifact ]
+//            ↑         ↑
+//            │         └─ tomar CODE dekhe. model NA. 0 token.
+//            └─ model dekhe. choto summary.
+//
+// `responseFormat: "content_and_artifact"` na dile ei array ta-i stringify
+// hoye model er kache chole jabe.
+const getWeekly = tool(
+  ({ city }) => {
+    // Bhaan korchi eta DB / API theke ashche.
+    const days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((d, i) => ({
+      day: d,
+      high: 26 + (i % 4),
+      low: 18 + (i % 3),
+      rainChance: (i * 13) % 100,
+      icon: i % 2 ? "cloud" : "sun",
+    }));
+
+    const wettest = days.reduce((a, b) => (b.rainChance > a.rainChance ? b : a));
+
+    return [
+      // [0] content — model ei tuku dekhe. ~25 token.
+      `${city} 7-day: highs ${Math.min(...days.map((d) => d.high))}-${Math.max(
+        ...days.map((d) => d.high),
+      )}°C. Wettest day ${wettest.day} (${wettest.rainChance}% rain).`,
+
+      // [1] artifact — model kokhono dekhe na. Chart/table render korar
+      //     jonno tomar frontend ei ta pabe.
+      { city, days, generatedFor: "weekly-chart" },
+    ];
+  },
+  {
+    name: "get_weekly",
+    description: "Get the 7-day weather outlook for a city.",
+    schema: z.object({ city: z.string() }),
+    responseFormat: "content_and_artifact",
+  },
+);
+
 // ─── [Step 4] nijer middleware ──────────────────────────────────────────────
 //
 // Middleware = agent-er loop-er majhe tomar code dhukanor jayga.
@@ -166,7 +211,7 @@ const traceMiddleware = createMiddleware({
 // 4. agent — `new` na, plain function call
 const agent = createAgent({
   model,
-  tools: [getWeather, getForecast],
+  tools: [getWeather, getForecast, getWeekly],
 
   // [Step 6] declare kore dite hobe, noile runtime.context faka thakbe.
   contextSchema,
@@ -273,6 +318,14 @@ async function streamRun(input) {
   return await stream.output;
 }
 
+// [Step 7] Final message list theke artifact gula tule ana. Plain JS —
+// kono LangChain API na. Ei ta-i tomar frontend e pathabe.
+function collectArtifacts(messages) {
+  return messages
+    .filter((m) => m.getType() === "tool" && m.artifact !== undefined)
+    .map((m) => ({ tool: m.name, artifact: m.artifact }));
+}
+
 console.log("Weather agent. `q` diye ber hobe.\n");
 
 while (true) {
@@ -292,6 +345,13 @@ while (true) {
   // uttor ta already stream hoye geche, tai ar print korchi na — shudhu
   // ekta notun line.
   console.log("\n");
+
+  // [Step 7] Artifact — real app e eta HTTP response e frontend ke pathabe,
+  // console e chapbe na.
+  const artifacts = collectArtifacts(result.messages);
+  if (artifacts.length) {
+    console.log("[artifacts]", JSON.stringify(artifacts, null, 2), "\n");
+  }
 }
 
 rl.close();
