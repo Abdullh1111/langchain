@@ -1,9 +1,18 @@
 // Step 1 — shobcheye simple agent. 5 ta jinis, er beshi kichu na.
 // Step 2 — systemPrompt + terminal loop + history.
 // Step 3 — streaming (invoke → streamEvents).
+// Step 4 — nijer middleware (createMiddleware er 6 ta hook).
+// Step 5 — built-in middleware (budget + retry).
 import { ChatOpenRouter } from "@langchain/openrouter";
 import { config } from "dotenv";
-import { createAgent, tool } from "langchain";
+import {
+  createAgent,
+  createMiddleware,
+  modelCallLimitMiddleware,
+  tool,
+  toolCallLimitMiddleware,
+  toolRetryMiddleware,
+} from "langchain";
 import readline from "readline/promises";
 import * as z from "zod";
 
@@ -34,10 +43,129 @@ const getWeather = tool(
   },
 );
 
+// [Step 5] Ekta iccha kore flaky tool — noile retry middleware kaj korche
+// kina dekha jabe na. Prothom 2 bar throw kore, 3rd bar e kaj kore.
+let forecastAttempts = 0;
+const getForecast = tool(
+  ({ city }) => {
+    forecastAttempts += 1;
+    if (forecastAttempts < 3) {
+      throw new Error(`upstream forecast API timed out (attempt ${forecastAttempts})`);
+    }
+    return `${city}: tomorrow 26°C, light rain in the evening.`;
+  },
+  {
+    name: "get_forecast",
+    description: "Get tomorrow's weather forecast for a city.",
+    schema: z.object({ city: z.string() }),
+  },
+);
+
+// ─── [Step 4] nijer middleware ──────────────────────────────────────────────
+//
+// Middleware = agent-er loop-er majhe tomar code dhukanor jayga.
+// 6 ta hook, ar egula 2 rokom:
+//
+//   NODE hook   — beforeAgent / beforeModel / afterModel / afterAgent
+//                 Kichu ghotar AGE ba PORE chole. State bodlate paro,
+//                 ba `jumpTo` diye loop thamiye dite paro.
+//
+//   WRAP hook   — wrapModelCall / wrapToolCall
+//                 Ghotona take GHIRE chole. Tumi `handler()` call koro.
+//                 Call na korle ghotona ta ghotbei na. Try/catch, timing,
+//                 retry, request modify — shob ekhane.
+//
+// Order:  before* → array-r prothom theke shesh
+//         after*  → ULTA, shesh theke prothom
+//         wrap*   → nested, prothom middleware baki shob ke ghire rakhe
+//
+// stderr e log korchi, stdout e na — noile streaming token er sathe mishe jabe.
+// `2>/dev/null` diye off korte parba.
+const log = (...a) => console.error("  \x1b[2m│", ...a, "\x1b[0m");
+
+let modelCalls = 0;
+
+const traceMiddleware = createMiddleware({
+  name: "TraceMiddleware",
+
+  // 1. Puro run e EKBAR, shob kichur age.
+  beforeAgent: (state) => {
+    modelCalls = 0;
+    log(`beforeAgent · history te ${state.messages.length} ta message`);
+  },
+
+  // 2. PROTTEK model call er age.
+  beforeModel: (state) => {
+    log(`beforeModel #${modelCalls + 1} · ${state.messages.length} ta message pathacchi`);
+  },
+
+  // 3. Model call ke GHIRE. request ekhane bodlano jay.
+  wrapModelCall: async (request, handler) => {
+    log(`wrapModelCall · model ke ${request.tools.length} ta tool dekhacchi`);
+
+    const t0 = Date.now();
+    const response = await handler(request); // ← ei line-i asol model call
+    log(`wrapModelCall · ${Date.now() - t0}ms · toolCalls=${response.tool_calls?.length ?? 0}`);
+
+    return response;
+  },
+
+  // 4. Prottek model response er pore.
+  afterModel: () => {
+    modelCalls += 1;
+  },
+
+  // 5. Prottek tool call ke GHIRE. Timing, audit log, error handling.
+  wrapToolCall: async (request, handler) => {
+    const t0 = Date.now();
+    log(`tool → ${request.toolCall.name}(${JSON.stringify(request.toolCall.args)})`);
+    try {
+      const result = await handler(request);
+      log(`tool ← ok · ${Date.now() - t0}ms`);
+      return result;
+    } catch (err) {
+      log(`tool ✗ ${err.message}`);
+      throw err;
+    }
+  },
+
+  // 6. Puro run e EKBAR, shesh e.
+  afterAgent: () => {
+    log(`afterAgent · moot ${modelCalls} ta model call`);
+  },
+});
+
 // 4. agent — `new` na, plain function call
 const agent = createAgent({
   model,
-  tools: [getWeather],
+  tools: [getWeather, getForecast],
+
+  // [Step 4/5] middleware ekta ARRAY — order matter kore.
+  //
+  // before* → upor theke niche.   after* → niche theke upor (ulta).
+  // Tai critical jinis (budget, guardrail) SHURUTE rakho.
+  middleware: [
+    // 1. Budget — runaway loop thamay. Tomar CRM-er hate-lekha step-budget
+    //    er official version. `exitBehavior: "end"` mane limit-e pouchale
+    //    crash na kore gracefully thame.
+    //    NOTE: `threadLimit` option-o ache, kintu tar jonno checkpointer
+    //    (= LangGraph) lage. `runLimit` ek run e koto — eta LangGraph-free.
+    modelCallLimitMiddleware({ runLimit: 6, exitBehavior: "end" }),
+    toolCallLimitMiddleware({ runLimit: 8, exitBehavior: "continue" }),
+
+    // 2. Retry — tool throw korle abar chesta kore, exponential backoff diye.
+    //    `onFailure: "continue"` mane shob retry fail korleo crash na —
+    //    error ta ToolMessage hoye model er kache jay, model decide kore.
+    toolRetryMiddleware({
+      maxRetries: 3,
+      initialDelayMs: 300,
+      onFailure: "continue",
+    }),
+
+    // 3. Trace shesh e — er upore ja ache shob ke ghire rakhbe... na.
+    //    Ulta: array-r SHESHE thakle eta shobar BHITORE thakbe.
+    traceMiddleware,
+  ],
 
   // [Step 2] systemPrompt — model ke ki bhabe behave korbe bola.
   // Prottek model call e ei ta pathano hoy, tomake bar bar dite hobe na.
@@ -85,7 +213,16 @@ async function streamRun(input) {
     (async () => {
       for await (const call of stream.toolCalls) {
         process.stdout.write(`\n[tool] ${call.name} ${JSON.stringify(call.input)}\n`);
-        process.stdout.write(`[tool] ↳ ${await call.output}\n`);
+
+        // ⚠️ `call.output` ekta PROMISE, ar tool throw korle eta REJECT kore.
+        // try/catch na dile unhandled rejection hoy ar puro process mara jay —
+        // jodio agent nijei error ta handle korte parto (retry / model ke
+        // ferot pathano). Ei bug ta hate hate khelam.
+        try {
+          process.stdout.write(`[tool] ↳ ${await call.output}\n`);
+        } catch (err) {
+          process.stdout.write(`[tool] ✗ ${err.message}\n`);
+        }
       }
     })(),
   ]);
