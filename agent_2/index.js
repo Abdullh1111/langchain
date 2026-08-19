@@ -6,6 +6,7 @@
 // Step 6 — contextSchema + runtime.context (tool jane ke jiggesh korche).
 // Step 7 — content_and_artifact (model summary dekhe, code full data pay).
 // Step 8 — structured output (uttor string na, typed object).
+// Step 9 — RAG (splitter → embeddings → vector store → retriever tool).
 import { ChatOpenRouter } from "@langchain/openrouter";
 import { config } from "dotenv";
 import {
@@ -16,6 +17,13 @@ import {
   toolCallLimitMiddleware,
   toolRetryMiddleware,
 } from "langchain";
+// [Step 9] RAG — 3 ta ALADA package. v1-e `langchain/vectorstores/memory`
+// NEI, legacy shob kichu @langchain/classic e chole geche.
+import { Embeddings } from "@langchain/core/embeddings";
+import { Document } from "@langchain/core/documents";
+import { MemoryVectorStore } from "@langchain/classic/vectorstores/memory";
+import { createRetrieverTool } from "@langchain/classic/tools/retriever";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import readline from "readline/promises";
 import * as z from "zod";
 
@@ -146,6 +154,124 @@ const getWeekly = tool(
   },
 );
 
+// ─── [Step 9] RAG ───────────────────────────────────────────────────────────
+//
+// RAG = 4 ta step, ar ekta-o magic na:
+//   1. Boro document ke CHOTO chunk e bhango       (splitter)
+//   2. Proti chunk ke ekta number array e badlao   (embeddings)
+//   3. Number array gula ekta store e rakho        (vector store)
+//   4. Prosno-o number array kore, kachakachi khojo (retriever)
+//
+// ── 2 nombor niye ekta problem ──────────────────────────────────────────────
+// OpenRouter er embeddings endpoint NEI. Tomar .env e shudhu OPENROUTER_API_KEY.
+// Tai nijer ekta Embeddings class likhchi — offline, key lage na.
+//
+// Embeddings base class e maat 2 ta method implement korte hoy.
+// Production e ei class ta bodle OpenAIEmbeddings / OllamaEmbeddings / Voyage
+// boshalei cholbe, baki code ek-i thakbe.
+const DIM = 256;
+
+function embedOne(text) {
+  const vec = new Float64Array(DIM);
+
+  // Text ke word e bhango, proti word ke hash kore ekta slot e felo.
+  for (const token of text.toLowerCase().match(/[a-z0-9]+/g) ?? []) {
+    let h = 0x811c9dc5; // FNV-1a hash
+    for (let i = 0; i < token.length; i++) {
+      h ^= token.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    vec[h % DIM] += 1;
+  }
+
+  // L2 normalise — noile lomba document choto-r cheye beshi score pabe.
+  let norm = 0;
+  for (let i = 0; i < DIM; i++) norm += vec[i] * vec[i];
+  norm = Math.sqrt(norm) || 1;
+
+  return Array.from(vec, (v) => v / norm);
+}
+
+class LocalEmbeddings extends Embeddings {
+  constructor(fields = {}) {
+    super(fields); // lagbei — this.caller (retry/concurrency) set kore
+  }
+  async embedDocuments(texts) {
+    return texts.map(embedOne);
+  }
+  async embedQuery(text) {
+    // ⚠️ embedQuery ar embedDocuments-er DIMENSION ek hote hobe. Store
+    // validate kore na — mismatch hole chupchap bhul result debe.
+    return embedOne(text);
+  }
+}
+
+// NOTE: eta LEXICAL matching (shobdo mile), semantic na. "holiday" likhle
+// "leave policy" khuje pabe na. Real embeddings model oita parbe. Learning
+// er jonno ei tuku jothesto — pipeline ta ek-i.
+
+const HANDBOOK = [
+  {
+    source: "umbrella-policy",
+    text: `Umbrella policy. Staff may claim one umbrella per calendar year, up to 900 BDT.
+Claims require a receipt uploaded to the HR portal within 30 days of purchase.
+Umbrellas lost on company premises are replaced free of charge, once per year.
+Golf umbrellas are not covered because they do not fit in the office lockers.`,
+  },
+  {
+    source: "rain-day-policy",
+    text: `Rain day policy. When rainfall exceeds 50mm before 7am, the office opens at 11am.
+Staff who cannot reach the office on a declared rain day may work from home without
+using a leave day. The rain day declaration is sent by SMS before 7:30am.
+Client meetings on a rain day must be moved to video call, not cancelled.`,
+  },
+  {
+    source: "heat-policy",
+    text: `Heat policy. When the forecast high exceeds 38 degrees Celsius, outdoor site
+visits are suspended for that day. Staff on site must return to the office by noon.
+Air-conditioned transport is reimbursed in full on declared heat days.
+Heat days do not count against the annual leave allowance.`,
+  },
+];
+
+async function buildHandbookTool() {
+  // 1. Split. chunkSize CHOTO rakhchi iccha kore — boro rakhle 3 ta policy
+  //    = 3 ta chunk, ar k:3 mane retriever SHOB kichu ferot dey. Tokhon
+  //    ranking-er kono mane thake na, RAG-o kaj korche kina bujha jay na.
+  const splitter = new RecursiveCharacterTextSplitter({
+    chunkSize: 220,
+    chunkOverlap: 40,
+  });
+
+  const splits = await splitter.splitDocuments(
+    HANDBOOK.map(
+      (d) => new Document({ pageContent: d.text, metadata: { source: d.source } }),
+    ),
+  );
+
+  // 2 + 3. Embed kore store e rakho. Ei line-tai embedDocuments() dake.
+  const store = new MemoryVectorStore(new LocalEmbeddings());
+  await store.addDocuments(splits);
+
+  // 4. Retriever ke tool banao. `k: 3` = shobcheye kachakachi 3 ta chunk.
+  //    ⚠️ createRetrieverTool er schema FIXED — shudhu { query: string }.
+  //    Nijer schema (filter, date range) chaile tool() diye hate likhte hobe
+  //    ar bhitore retriever.invoke() call korte hobe.
+  const searchHandbook = createRetrieverTool(store.asRetriever({ k: 3 }), {
+    name: "search_handbook",
+    description:
+      "Search the internal company handbook for weather-related policies " +
+      "(umbrella claims, rain days, heat days). Use this for any question " +
+      "about company rules instead of answering from memory.",
+  });
+
+  return { searchHandbook, store, chunks: splits.length };
+}
+
+// Top-level await — app start e EKBAR index hoy, proti prosno te na.
+const { searchHandbook, chunks } = await buildHandbookTool();
+console.error(`[rag] handbook indexed: ${chunks} chunks`);
+
 // ─── [Step 8] structured output ─────────────────────────────────────────────
 //
 // `.describe()` gula shudhu comment na — model EI GULA PORE. Schema ta-i
@@ -238,7 +364,7 @@ const traceMiddleware = createMiddleware({
 // rakhchi ar duijaygay spread korbo.
 const shared = {
   model,
-  tools: [getWeather, getForecast, getWeekly],
+  tools: [getWeather, getForecast, getWeekly, searchHandbook],
 
   // [Step 6] declare kore dite hobe, noile runtime.context faka thakbe.
   contextSchema,
@@ -272,12 +398,15 @@ const shared = {
 
   // [Step 2] systemPrompt — model ke ki bhabe behave korbe bola.
   // Prottek model call e ei ta pathano hoy, tomake bar bar dite hobe na.
-  systemPrompt: `You are a concise weather assistant.
+  systemPrompt: `You are a concise weather assistant for company staff.
 
 Rules:
-- Always use the get_weather tool. Never answer weather from memory.
-- Reply in one short sentence.
-- If the user asks anything unrelated to weather, say you only do weather.`,
+- For current weather, use get_weather. Never answer weather from memory.
+- For questions about COMPANY POLICY (umbrella claims, rain days, heat days),
+  you MUST call search_handbook first. Never answer policy from memory.
+- If the handbook does not cover it, say so plainly instead of guessing.
+- Reply in one or two short sentences.
+- If the user asks anything unrelated to weather or weather policy, say so.`,
 };
 
 // Normal agent — streaming er jonno. responseFormat NEI.
