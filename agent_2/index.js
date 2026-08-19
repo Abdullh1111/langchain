@@ -3,6 +3,7 @@
 // Step 3 — streaming (invoke → streamEvents).
 // Step 4 — nijer middleware (createMiddleware er 6 ta hook).
 // Step 5 — built-in middleware (budget + retry).
+// Step 6 — contextSchema + runtime.context (tool jane ke jiggesh korche).
 import { ChatOpenRouter } from "@langchain/openrouter";
 import { config } from "dotenv";
 import {
@@ -29,10 +30,18 @@ const model = new ChatOpenRouter({
 });
 
 // 3. tool
+// [Step 6] 2nd argument `runtime` — ekhane-i context, writer, toolCallId.
 const getWeather = tool(
-  ({ city }) => {
-    console.log("weather tool called");
-    return `It's 24°C and sunny in ${city}.`;
+  ({ city }, runtime) => {
+    console.error("weather tool called");
+
+    // Model ei value gula pathay NAI — code theke esheche.
+    const { userName, timezone, role } = runtime.context;
+
+    return (
+      `It's 24°C and sunny in ${city}. ` +
+      `(for ${userName}, tz ${timezone}, role ${role})`
+    );
   },
   {
     name: "get_weather",
@@ -42,6 +51,25 @@ const getWeather = tool(
     }),
   },
 );
+
+// ─── [Step 6] contextSchema ─────────────────────────────────────────────────
+//
+// Per-run data — ke request korche, tar role, timezone. Prottek request e alada.
+//
+// KENO tool-er schema te ei gula rakhi na:
+//   1. Model tokhon `userId` nijer theke banabe ba bhul ta dibe
+//   2. Model ke user "ami admin" bole convince kore felte parbe
+//   3. Sudhu sudhu token — model-er ei data janar kono dorkar nei
+//
+// contextSchema diye pathale model eta DEKHE-I NA. Tumi code theke dao,
+// tool code theke pore. Model-er hat diye jay na.
+//
+// Plain zod use korchi — LangGraph-er StateSchema na, tai eta LangGraph-free.
+const contextSchema = z.object({
+  userName: z.string(),
+  role: z.enum(["staff", "admin"]),
+  timezone: z.string().default("Asia/Dhaka"),
+});
 
 // [Step 5] Ekta iccha kore flaky tool — noile retry middleware kaj korche
 // kina dekha jabe na. Prothom 2 bar throw kore, 3rd bar e kaj kore.
@@ -140,6 +168,9 @@ const agent = createAgent({
   model,
   tools: [getWeather, getForecast],
 
+  // [Step 6] declare kore dite hobe, noile runtime.context faka thakbe.
+  contextSchema,
+
   // [Step 4/5] middleware ekta ARRAY — order matter kore.
   //
   // before* → upor theke niche.   after* → niche theke upor (ulta).
@@ -195,8 +226,19 @@ let history = [];
 //   stream.messages   → proti LLM call; .text / .reasoning / .toolCalls / .usage
 //   stream.toolCalls  → tool execution; .name .input, await .output
 //   stream.output     → final state (invoke() ja dito, ei tai)
+// [Step 6] Per-run config. Real app e eta session / JWT theke ashbe.
+// `.parse()` kore nicchi — bhul shape hole EKHANE throw korbe, tool-er
+// bhitore giye `undefined` hoye na.
+const runConfig = {
+  context: contextSchema.parse({
+    userName: "Abdullah",
+    role: "admin",
+    timezone: "Asia/Dhaka",
+  }),
+};
+
 async function streamRun(input) {
-  const stream = await agent.streamEvents(input, { version: "v3" });
+  const stream = await agent.streamEvents(input, { ...runConfig, version: "v3" });
 
   // ⚠️ Promise.all LAGBEI. Duita `for await` ek er por ek likhle dwitiyo ta
   // starve kore — prothom iterator ta shob event kheye fele. Egula
