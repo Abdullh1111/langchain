@@ -7,6 +7,7 @@
 // Step 7 — content_and_artifact (model summary dekhe, code full data pay).
 // Step 8 — structured output (uttor string na, typed object).
 // Step 9 — RAG (splitter → embeddings → vector store → retriever tool).
+// Step 10 — subagent (ekta agent ke tool baniye onno agent-e deoya).
 import { ChatOpenRouter } from "@langchain/openrouter";
 import { config } from "dotenv";
 import {
@@ -272,6 +273,85 @@ async function buildHandbookTool() {
 const { searchHandbook, chunks } = await buildHandbookTool();
 console.error(`[rag] handbook indexed: ${chunks} chunks`);
 
+// ─── [Step 10] subagent ─────────────────────────────────────────────────────
+//
+// Subagent kono notun concept NA. Eta shudhu:
+//   ekta createAgent → tool() diye mora → onno agent-er tools[] e deoya
+//
+// Mane parent agent-er kache eta ekta SADHARON TOOL. Se jane na bhitore
+// arekta LLM chalche.
+//
+// KENO lagbe — 3 ta karon:
+//
+//   1. TOOL BHIR. Parent er kache 4 ta tool. 40 ta hole model gulie fele.
+//      10 ta subagent, protita 4 ta tool niye → parent dekhe 1 ta tool.
+//
+//   2. CONTEXT PORISKAR. Subagent nijer alada message list e kaj kore.
+//      Se 10 bar handbook search korle oi 10 ta tool result parent-er
+//      history te DHOKE NA — shudhu final summary ta dhoke.
+//
+//   3. ALADA PROMPT / MODEL. Subagent ke cheap model + kora prompt dite paro.
+//
+// ⚠️ Ja ekhane use korchi NA (egula LangGraph, alada repo-r jonno):
+//   - getCurrentTaskInput() diye parent-er state pora → bodole arg pathacchi
+//   - new Command({ update }) diye parent-er state lekha → bodole string return
+//   - subagent-er nijer checkpointer / interrupt
+
+// Subagent 1 — handbook ghete report dey. Parent-er cheye kora prompt.
+const researcher = createAgent({
+  name: "researcher",
+  model,
+  tools: [searchHandbook],
+  systemPrompt: `You are a policy research subagent.
+
+- Search the handbook, possibly several times with different wordings.
+- Report ONLY what the handbook actually says, with the policy name.
+- If the handbook does not cover it, say "not covered" plainly. Never guess.
+- Output bullet points. No preamble.`,
+});
+
+// Subagent 2 — rough note ke poriskar bakko banay. Tool lage na.
+const writer = createAgent({
+  name: "writer",
+  model,
+  tools: [],
+  systemPrompt: `You are a writing subagent.
+Rewrite the given notes as a clear, short reply for a staff member.
+Plain language. No marketing tone. Never invent facts that are not in the notes.`,
+});
+
+const SUBAGENTS = { researcher, writer };
+
+// EKTA dispatch tool, proti agent-er jonno alada tool na. Keno: 10 ta agent
+// hole 10 ta tool = abar shei tool bhir. Ekta tool + ekta enum = 1 ta slot.
+const task = tool(
+  async ({ agentName, description }) => {
+    const sub = SUBAGENTS[agentName];
+    if (!sub) return `Unknown agent "${agentName}". Available: ${Object.keys(SUBAGENTS).join(", ")}.`;
+
+    // Notun message list — parent-er history EKHANE ashe na.
+    const r = await sub.invoke({ messages: [{ role: "user", content: description }] });
+
+    // Shudhu final text ta parent ke ferot jay. Bhitorer tool call gula na.
+    return r.messages.at(-1)?.text ?? "(subagent returned nothing)";
+  },
+  {
+    name: "task",
+    description: `Delegate a self-contained task to a subagent.
+
+Available agents:
+- researcher: search the company handbook and report findings
+- writer: turn rough notes into a clear short reply
+
+IMPORTANT: the subagent CANNOT see this conversation. It only sees your
+description. Put every fact it needs into the description.`,
+    schema: z.object({
+      agentName: z.enum(["researcher", "writer"]),
+      description: z.string().describe("Self-contained task description"),
+    }),
+  },
+);
+
 // ─── [Step 8] structured output ─────────────────────────────────────────────
 //
 // `.describe()` gula shudhu comment na — model EI GULA PORE. Schema ta-i
@@ -364,7 +444,7 @@ const traceMiddleware = createMiddleware({
 // rakhchi ar duijaygay spread korbo.
 const shared = {
   model,
-  tools: [getWeather, getForecast, getWeekly, searchHandbook],
+  tools: [getWeather, getForecast, getWeekly, searchHandbook, task],
 
   // [Step 6] declare kore dite hobe, noile runtime.context faka thakbe.
   contextSchema,
@@ -405,6 +485,8 @@ Rules:
 - For questions about COMPANY POLICY (umbrella claims, rain days, heat days),
   you MUST call search_handbook first. Never answer policy from memory.
 - If the handbook does not cover it, say so plainly instead of guessing.
+- For a question that needs SEVERAL policies compared, or a long answer that
+  must be rewritten cleanly, use the task tool to delegate to a subagent.
 - Reply in one or two short sentences.
 - If the user asks anything unrelated to weather or weather policy, say so.`,
 };
